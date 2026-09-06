@@ -567,6 +567,7 @@ class Qdl:
         self._cdc = None
         self._sahara = None
         self._parts = {}
+        self._total_sectors = None
 
     @property
     def partitions(self) -> dict:
@@ -638,6 +639,46 @@ class Qdl:
         logger.error(f"No such partition: {partition}")
         return False
 
+    def _read_lba_range(self, first_lba: int, sectors: int, label: str) -> Optional[bytes]:
+        """Chunked 0xB9 read of `sectors` sectors starting at `first_lba`.
+
+        Clips to the device's declared total sector count (self._total_sectors,
+        populated by read_gpt()) if known. The static partition table can
+        describe a larger disk than the device's own GPT header currently
+        declares (e.g. a smaller/replacement eMMC than this firmware's
+        partition layout was designed for); reading far past that declared
+        boundary has been observed to make the device stall/hang rather than
+        fail fast, so anything past it is refused instead of attempted.
+        """
+        if self._total_sectors is not None and first_lba + sectors > self._total_sectors:
+            available = max(0, self._total_sectors - first_lba)
+            if available <= 0:
+                logger.error(
+                    f"{label} (lba {first_lba}) lies entirely beyond the device's "
+                    f"declared capacity ({self._total_sectors} sectors); nothing to read."
+                )
+                return None
+            logger.warning(
+                f"{label} extends to sector {first_lba + sectors}, but the device only "
+                f"declares {self._total_sectors} sectors total. "
+                f"Reading only the available {available}/{sectors} sectors."
+            )
+            sectors = available
+
+        buf = bytearray()
+        remaining = sectors
+        lba = first_lba
+        while remaining > 0:
+            n = min(self.PARTITION_READ_CHUNK_SECTORS, remaining)
+            chunk = self._sahara.vendor_cmd_b9_read_raw(lba, n)
+            if chunk is None:
+                logger.error(f"Failed reading {label} at sector (lba) {lba} (n={n})")
+                return None
+            buf.extend(chunk)
+            lba += n
+            remaining -= n
+        return bytes(buf)
+
     def read_partition(self, partition: str) -> Optional[bytes]:
         if not self._sahara:
             raise RuntimeError("Not initialized")
@@ -646,21 +687,18 @@ class Qdl:
             return None
         first_lba = self._parts[partition]["first_lba"]
         sectors = self._parts[partition]["sectors"]
-        buf = bytearray()
-        remaining = sectors
-        lba = first_lba
-        while remaining > 0:
-            n = min(self.PARTITION_READ_CHUNK_SECTORS, remaining)
-            chunk = self._sahara.vendor_cmd_b9_read_raw(lba, n)
-            if chunk is None:
-                logger.error(
-                    f"Failed reading partition {partition} at sector (lba) {lba} (n={n})"
-                )
-                return None
-            buf.extend(chunk)
-            lba += n
-            remaining -= n
-        return bytes(buf)
+        return self._read_lba_range(first_lba, sectors, f"Partition '{partition}'")
+
+    def read_raw_range(self, start_lba: int, sectors: int) -> Optional[bytes]:
+        """Read an arbitrary raw LBA range, independent of the partition table.
+
+        Useful for regions the partition table doesn't cover at all, e.g. the
+        protective MBR + primary GPT header + partition entry table + padding
+        that sits before the first real partition entry.
+        """
+        if not self._sahara:
+            raise RuntimeError("Not initialized")
+        return self._read_lba_range(start_lba, sectors, "Raw range")
 
     def write_partition(
         self, partition: str, data: bytes, allow_padding: bool = False
@@ -711,6 +749,7 @@ class Qdl:
         # Since it is written to the final sector of the disk, (backup_lba + 1) gives total sectors.
         backup_gpt_lba = struct.unpack_from("<Q", gpt_hdr, 0x20)[0]
         total_sectors = backup_gpt_lba + 1
+        self._total_sectors = total_sectors
         logger.info("Total eMMC sectors detected via GPT: %d", total_sectors)
 
         last_usable_lba = struct.unpack_from("<Q", gpt_hdr, 0x30)[0]
@@ -772,25 +811,57 @@ class Qdl:
 
         raise RuntimeError
 
+    CHUNK_MAX_RETRIES = 6
+
     def raw_dump_emmc(
-        self, output_path: Path, total_sectors: int = 15269888, chunk_size: int = 2048
+        self,
+        output_path: Path,
+        total_sectors: int = 15269888,
+        chunk_size: int = 2048,
+        resume: bool = False,
     ) -> bool:
         if not self._sahara:
             logger.error("Not initialized")
             return False
-        logger.info("Starting full eMMC raw dump...")
-        sectors_read = 0
-        start_lba = 0
-        start_time = time.time()
 
-        with open(output_path, "wb") as f:
+        start_lba = 0
+        sectors_read = 0
+        mode = "wb"
+
+        if resume and output_path.exists():
+            existing_size = output_path.stat().st_size
+            resumable_sectors = existing_size // 512
+            if resumable_sectors > 0:
+                if resumable_sectors >= total_sectors:
+                    logger.info("Existing output already covers the full dump size.")
+                    return True
+                sectors_read = resumable_sectors
+                mode = "r+b"
+                logger.info(
+                    f"Resuming dump: {existing_size} bytes ({sectors_read} sectors) "
+                    "already present, continuing from there."
+                )
+
+        logger.info("Starting full eMMC raw dump...")
+        start_time = time.time()
+        start_sectors_read = sectors_read
+
+        with open(output_path, mode) as f:
+            if mode == "r+b":
+                # Drop any trailing partial (non-sector-aligned) bytes from a
+                # previous interrupted run before appending more data.
+                f.seek(sectors_read * 512)
+                f.truncate()
+                f.seek(0, os.SEEK_END)
+
             while sectors_read < total_sectors:
                 to_read = min(chunk_size, total_sectors - sectors_read)
                 current_lba = start_lba + sectors_read
 
                 pct = (sectors_read / total_sectors) * 100
                 elapsed = time.time() - start_time
-                sec_per_s = sectors_read / elapsed if elapsed > 0 else 0
+                done_this_run = sectors_read - start_sectors_read
+                sec_per_s = done_this_run / elapsed if elapsed > 0 else 0
                 mb_per_s = sec_per_s * 512 / (1024 * 1024)
                 eta = (
                     (total_sectors - sectors_read) / sec_per_s
@@ -803,10 +874,24 @@ class Qdl:
                     end="\r",
                 )
 
-                chunk = self._sahara.vendor_cmd_b9_read_raw(current_lba, to_read)
+                chunk = None
+                for attempt in range(1, self.CHUNK_MAX_RETRIES + 1):
+                    chunk = self._sahara.vendor_cmd_b9_read_raw(current_lba, to_read)
+                    if chunk is not None:
+                        break
+                    backoff = min(30.0, 2.0 * attempt)
+                    print(
+                        f"\n  [WARN] Read stalled at LBA {current_lba} "
+                        f"(attempt {attempt}/{self.CHUNK_MAX_RETRIES}), "
+                        f"retrying in {backoff:.0f}s..."
+                    )
+                    time.sleep(backoff)
+
                 if chunk is None:
                     print(
-                        f"\n  [ERROR] Failed to read chunk at LBA {current_lba}. Dump aborted."
+                        f"\n  [ERROR] Failed to read chunk at LBA {current_lba} after "
+                        f"{self.CHUNK_MAX_RETRIES} attempts. Dump aborted "
+                        f"(partial data kept — rerun with --resume to continue)."
                     )
                     break
 
@@ -818,7 +903,10 @@ class Qdl:
             logger.info(f"Successfully dumped entire eMMC to {output_path}")
             return True
         else:
-            logger.error(f"Incomplete dump. Saved up to sector {sectors_read}.")
+            logger.error(
+                f"Incomplete dump. Saved up to sector {sectors_read}/{total_sectors}. "
+                "Rerun with --resume to continue from this point."
+            )
             return False
 
     def raw_write_emmc(self, input_path: Path, chunk_sectors: int = 2048) -> bool:
@@ -965,7 +1053,10 @@ def handle_info(qdl: Qdl, args: argparse.Namespace):
 def handle_dump(qdl: Qdl, args: argparse.Namespace):
     output_img = Path(args.output)
 
-    # We read the GPT in both paths to either get total disk sectors or individual partition parameters
+    # We read the GPT in every path: for --full it gives total disk sectors,
+    # for -p it's needed to resolve the partition, and for --sectors it's
+    # needed to know the device's real declared capacity so the raw read can
+    # be clipped instead of stalling the device past it.
     try:
         total_sectors = qdl.read_gpt()
     except Exception as e:
@@ -973,11 +1064,28 @@ def handle_dump(qdl: Qdl, args: argparse.Namespace):
         return
 
     if args.full:
-        qdl.raw_dump_emmc(output_img, total_sectors=total_sectors)
+        qdl.raw_dump_emmc(
+            output_img, total_sectors=total_sectors, resume=args.resume
+        )
+    elif args.sectors is not None:
+        # Arbitrary raw LBA range, independent of the partition table. Useful
+        # for regions the table doesn't cover at all, e.g. the protective MBR
+        # + primary GPT header + partition entry table + padding that sits
+        # before the first real partition entry.
+        logger.info(
+            f"Dumping raw range: lba={args.start_lba}, sectors={args.sectors}..."
+        )
+        data = qdl.read_raw_range(args.start_lba, args.sectors)
+        if data is not None:
+            output_img.write_bytes(data)
+            logger.info(f"Successfully dumped raw range out to {output_img}")
+        else:
+            logger.error("Failed to dump raw LBA range.")
     else:
         if not args.partition:
             logger.error(
-                "Error: --partition name required unless doing a --full disk dump"
+                "Error: --partition name required unless doing a --full disk dump "
+                "or a --sectors raw range dump"
             )
             return
         if args.partition not in qdl.partitions:
@@ -1097,8 +1205,12 @@ Examples:
      python3 ky-edl.py info
   2. Dump entire eMMC:
      python3 ky-edl.py dump --full -o full_emmc.img
+  2b. Resume an interrupted full dump:
+     python3 ky-edl.py dump --full --resume -o full_emmc.img
   3. Dump a single partition:
      python3 ky-edl.py dump -p system -o system.img
+  3b. Dump a raw LBA range (e.g. MBR/GPT header/entries before the first partition):
+     python3 ky-edl.py dump --start-lba 0 --sectors 16384 -o gpt.img
   4. Flash a single partition:
      python3 ky-edl.py flash -p system -i system.img
   5. Flash an entire raw eMMC image:
@@ -1143,9 +1255,11 @@ Check SecureBoot bit, and reads the GUID Partition Table (GPT) map.
         "dump",
         help="Dump data from the device and save it to a local file.",
         description="""
-[dump] 
-Reads data from the eMMC chip via Kyocera modifed Sahara commands. Can dump a specific 
-partition by name or dump the entire raw eMMC.
+[dump]
+Reads data from the eMMC chip via Kyocera modifed Sahara commands. Can dump a specific
+partition by name, dump the entire raw eMMC, or dump an arbitrary raw LBA range
+(e.g. the MBR/GPT header/partition table region before the first named partition,
+which --partition and --full don't otherwise cover on their own).
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1155,6 +1269,25 @@ partition by name or dump the entire raw eMMC.
     dump_parser.add_argument("-p", "--partition", help="Name of the partition to dump.")
     dump_parser.add_argument(
         "--full", action="store_true", help="Dump the entire eMMC."
+    )
+    dump_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a --full dump from an existing partial --output file instead of starting over.",
+    )
+    dump_parser.add_argument(
+        "--start-lba",
+        type=lambda x: int(x, 0),
+        default=0,
+        help="First sector to read for a raw LBA-range dump (used with --sectors, default: 0).",
+    )
+    dump_parser.add_argument(
+        "--sectors",
+        type=lambda x: int(x, 0),
+        default=None,
+        help="Dump this many raw sectors starting at --start-lba, independent of the "
+        "partition table (e.g. --start-lba 0 --sectors 16384 for the MBR/GPT/entries "
+        "region before the first partition). Overrides --partition/--full.",
     )
 
     # Action: Flash

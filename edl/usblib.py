@@ -323,7 +323,7 @@ class usb_class(DeviceClass):
         epr = self.EP_IN.read
         extend = res.extend
         retries = 0
-        max_retries = 10
+        max_retries = 20
         while len(res) < resplen:
             try:
                 resplen = epr(buffer, timeout)
@@ -335,11 +335,14 @@ class usb_class(DeviceClass):
                 if "timed out" in error:
                     if timeout is None:
                         return b""
-                    # logger.debug("Timed out")
+                    # A stalled eMMC read (e.g. controller busy with GC/bad-block
+                    # remapping) can take far longer than one bulk-read timeout.
+                    # Back off and keep waiting instead of giving up after ~10s.
                     retries += 1
                     if retries >= max_retries:
                         return b""
-                    timeout += 1
+                    time.sleep(min(2.0, 0.1 * retries))
+                    timeout += 1000
                 elif "Overflow" in error:
                     logger.error("USB Overflow")
                     return b""
